@@ -2482,6 +2482,54 @@ func TestSendSamplesWithBackoffWithSampleAgeLimit(t *testing.T) {
 	}
 }
 
+func TestSendSamplesWithBackoffAgeFilteredPayloadMetrics(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.DefaultQueueConfig
+	cfg.SampleAgeLimit = model.Duration(time.Minute)
+	oldTimestamp := timestamp.FromTime(time.Now().Add(-2 * time.Minute))
+	freshTimestamp := timestamp.FromTime(time.Now().Add(-time.Second))
+	samples := []prompb.TimeSeries{
+		{Labels: []prompb.Label{{Name: "__name__", Value: "old"}}, Samples: []prompb.Sample{{Timestamp: oldTimestamp, Value: 1}}},
+		{Labels: []prompb.Label{{Name: "__name__", Value: "fresh"}}, Samples: []prompb.Sample{{Timestamp: freshTimestamp, Value: 2}}},
+	}
+
+	var (
+		receivedBytes   int
+		receivedSamples []prompb.Sample
+	)
+	client := &MockWriteClient{
+		StoreFunc: func(_ context.Context, req []byte, _ int) (WriteResponseStats, error) {
+			receivedBytes = len(req)
+			data, err := compression.Decode(compression.Snappy, req, nil)
+			if err != nil {
+				return WriteResponseStats{}, err
+			}
+			var decoded prompb.WriteRequest
+			if err := proto.Unmarshal(data, &decoded); err != nil {
+				return WriteResponseStats{}, err
+			}
+			for _, ts := range decoded.Timeseries {
+				receivedSamples = append(receivedSamples, ts.Samples...)
+			}
+			return WriteResponseStats{}, nil
+		},
+		NameFunc:     func() string { return "test" },
+		EndpointFunc: func() string { return "http://test" },
+	}
+	m := newTestQueueManager(t, cfg, config.DefaultMetadataConfig, defaultFlushDeadline, client, remoteapi.WriteV1MessageType)
+	_, err := m.shards.sendSamplesWithBackoff(t.Context(), samples, len(samples), 0, 0, proto.NewBuffer(nil), compression.NewSyncEncodeBuffer(), compression.Snappy)
+	require.NoError(t, err)
+	require.Equal(t, []prompb.Sample{{Timestamp: freshTimestamp, Value: 2}}, receivedSamples)
+
+	if got := client_testutil.ToFloat64(m.metrics.samplesTotal); got != 1 {
+		t.Errorf("sample attempts must count the sample in the request passed to Store: got %v, want 1", got)
+	}
+	if got := client_testutil.ToFloat64(m.metrics.sentBytesTotal); got != float64(receivedBytes) {
+		t.Errorf("sent bytes must match the compressed request passed to Store: got %v, want %v", got, receivedBytes)
+	}
+}
+
 func filterTsLimit(limit int64, ts prompb.TimeSeries) bool {
 	return limit > ts.Samples[0].Timestamp
 }

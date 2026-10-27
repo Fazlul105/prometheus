@@ -732,7 +732,8 @@ func (c *timeSeriesAgeChecker) checkAndRecordIfOld(timestamp int64, dataType str
 	return true
 }
 
-func isTimeSeriesOldFilter(metrics *queueManagerMetrics, baseTime time.Time, sampleAgeLimit time.Duration) func(ts prompb.TimeSeries) bool {
+// Filter expired v1 data and count the items kept for the current send attempt.
+func isTimeSeriesOldFilter(metrics *queueManagerMetrics, baseTime time.Time, sampleAgeLimit time.Duration, counts *requestDataCounts) func(ts prompb.TimeSeries) bool {
 	checker := &timeSeriesAgeChecker{
 		metrics:        metrics,
 		baseTime:       baseTime,
@@ -743,14 +744,24 @@ func isTimeSeriesOldFilter(metrics *queueManagerMetrics, baseTime time.Time, sam
 		// Only the first element should be set in the series, therefore we only check the first element.
 		switch {
 		case len(ts.Samples) > 0:
-			return checker.checkAndRecordIfOld(ts.Samples[0].Timestamp, "sample")
+			if checker.checkAndRecordIfOld(ts.Samples[0].Timestamp, "sample") {
+				return true
+			}
+			counts.samples += len(ts.Samples)
 		case len(ts.Histograms) > 0:
-			return checker.checkAndRecordIfOld(ts.Histograms[0].Timestamp, "histogram")
+			if checker.checkAndRecordIfOld(ts.Histograms[0].Timestamp, "histogram") {
+				return true
+			}
+			counts.histograms += len(ts.Histograms)
 		case len(ts.Exemplars) > 0:
-			return checker.checkAndRecordIfOld(ts.Exemplars[0].Timestamp, "exemplar")
+			if checker.checkAndRecordIfOld(ts.Exemplars[0].Timestamp, "exemplar") {
+				return true
+			}
+			counts.exemplars += len(ts.Exemplars)
 		default:
 			return false
 		}
+		return false
 	}
 }
 
@@ -2136,12 +2147,13 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.Ti
 		lowest := s.qm.buildRequestLimitTimestamp.Load()
 		if isSampleOld(currentTime, time.Duration(s.qm.cfg.SampleAgeLimit), lowest) {
 			// This will filter out old samples during retries.
-			req2, _, lowest, err := buildWriteRequest(
+			var counts requestDataCounts
+			req2, filteredHighest, lowest, err := buildWriteRequest(
 				s.qm.logger,
 				samples,
 				nil,
 				pBuf,
-				isTimeSeriesOldFilter(s.qm.metrics, currentTime, time.Duration(s.qm.cfg.SampleAgeLimit)),
+				isTimeSeriesOldFilter(s.qm.metrics, currentTime, time.Duration(s.qm.cfg.SampleAgeLimit), &counts),
 				buf,
 				compr,
 			)
@@ -2150,6 +2162,12 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.Ti
 				return err
 			}
 			req = req2
+			highest = filteredHighest
+			sc.sampleCount = counts.samples
+			sc.exemplarCount = counts.exemplars
+			sc.histogramCount = counts.histograms
+			reqSize = len(req)
+			sc.reqSize = reqSize
 		}
 
 		cl := s.qm.client()
@@ -2627,6 +2645,12 @@ type sendBatchContext struct {
 	exemplarCount  int
 	histogramCount int
 	reqSize        int
+}
+
+type requestDataCounts struct {
+	samples    int
+	exemplars  int
+	histograms int
 }
 
 // batchMetricsUpdater encapsulates metrics update operations for batch sending.
