@@ -324,6 +324,8 @@ func (p *OpenMetricsParser) StartTimestamp() int64 {
 	}
 	resetStart := p.start
 	resetMType := p.mtype
+	resetMFNameLen := p.mfNameLen
+	resetUnit := p.unit
 
 	p.skipSTSeries = false
 	p.ignoreExemplar = true
@@ -331,6 +333,8 @@ func (p *OpenMetricsParser) StartTimestamp() int64 {
 		p.l = resetLexer
 		p.start = resetStart
 		p.mtype = resetMType
+		p.mfNameLen = resetMFNameLen
+		p.unit = resetUnit
 		p.ignoreExemplar = false
 	}()
 

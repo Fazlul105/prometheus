@@ -1177,10 +1177,11 @@ func TestOMNullByteHandling(t *testing.T) {
 // TODO(maniktherana): Make sure OM 1.1/2.0 pass ST via metadata or exemplar-like to avoid this.
 func TestOpenMetricsStartTimestamp(t *testing.T) {
 	for _, tcase := range []struct {
-		name                 string
-		input                string
-		expected             []parsedEntry
-		checkValuesAndLabels bool
+		name                    string
+		input                   string
+		expected                []parsedEntry
+		checkValuesAndLabels    bool
+		enableTypeAndUnitLabels bool
 	}{
 		{
 			name: "_created line is a first one",
@@ -1338,9 +1339,54 @@ c_created{a="xb",b="y"} 200
 			},
 			checkValuesAndLabels: true,
 		},
+		{
+			name: "lookahead restores unit metadata",
+			input: `# TYPE c counter
+c_total{a="x",b="by"} 1
+c_created{a="x",b="by"} 100
+c_total{a="xb",b="y"} 2
+c_total{a="xbby"} 3
+# UNIT next_seconds seconds
+# TYPE next_seconds gauge
+next_seconds 4
+# EOF
+`,
+			expected: []parsedEntry{
+				{m: "c", typ: model.MetricTypeCounter},
+				{
+					m:    `c_total{a="x",b="by"}`,
+					v:    1,
+					lset: labels.FromStrings("__name__", "c_total", "__type__", "counter", "a", "x", "b", "by"),
+					st:   100000,
+				},
+				{
+					m:    `c_total{a="xb",b="y"}`,
+					v:    2,
+					lset: labels.FromStrings("__name__", "c_total", "__type__", "counter", "a", "xb", "b", "y"),
+				},
+				{
+					m:    `c_total{a="xbby"}`,
+					v:    3,
+					lset: labels.FromStrings("__name__", "c_total", "__type__", "counter", "a", "xbby"),
+				},
+				{m: "next_seconds", unit: "seconds"},
+				{m: "next_seconds", typ: model.MetricTypeGauge},
+				{
+					m:    "next_seconds",
+					v:    4,
+					lset: labels.FromStrings("__name__", "next_seconds", "__type__", "gauge", "__unit__", "seconds"),
+				},
+			},
+			checkValuesAndLabels:    true,
+			enableTypeAndUnitLabels: true,
+		},
 	} {
 		t.Run(fmt.Sprintf("case=%v", tcase.name), func(t *testing.T) {
-			p := NewOpenMetricsParser([]byte(tcase.input), labels.NewSymbolTable(), WithOMParserSTSeriesSkipped())
+			opts := []OpenMetricsOption{WithOMParserSTSeriesSkipped()}
+			if tcase.enableTypeAndUnitLabels {
+				opts = append(opts, WithOMParserTypeAndUnitLabels())
+			}
+			p := NewOpenMetricsParser([]byte(tcase.input), labels.NewSymbolTable(), opts...)
 			got := testParse(t, p)
 			if !tcase.checkValuesAndLabels {
 				resetValAndLset(got) // Keep the existing failure cases focused on metric entries and ST.
