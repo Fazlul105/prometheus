@@ -467,13 +467,16 @@ func (p *MemPostings) PostingsForLabelMatching(ctx context.Context, name string,
 	readOnlyLabelValues := p.lvs[name]
 	p.mtx.RUnlock()
 
-	vals := make([]string, 0, len(readOnlyLabelValues))
+	var vals []string
 	for i, v := range readOnlyLabelValues {
 		if i%checkContextEveryNIterations == 0 && ctx.Err() != nil {
 			return ErrPostings(ctx.Err())
 		}
 
 		if match(v) {
+			if vals == nil {
+				vals = make([]string, 0, len(readOnlyLabelValues))
+			}
 			vals = append(vals, v)
 		}
 	}
