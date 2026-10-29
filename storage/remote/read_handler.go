@@ -141,10 +141,8 @@ func (h *readHandler) remoteReadSamples(
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Content-Encoding", "snappy")
 
-	resp := prompb.ReadResponse{
-		Results: make([]*prompb.QueryResult, len(req.Queries)),
-	}
-	for i, query := range req.Queries {
+	var resp sampledReadResponseEncoder
+	for _, query := range req.Queries {
 		if err := func() error {
 			filteredMatchers, err := filterExtLabelsFromMatchers(query.Matchers, externalLabels)
 			if err != nil {
@@ -174,18 +172,13 @@ func (h *readHandler) remoteReadSamples(
 				}
 			}
 
-			var ws annotations.Annotations
-			resp.Results[i], ws, err = ToQueryResult(querier.Select(ctx, false, hints, filteredMatchers...), h.remoteReadSampleLimit)
+			var warnings annotations.Annotations
+			warnings, err = resp.appendQueryResult(querier.Select(ctx, false, hints, filteredMatchers...), h.remoteReadSampleLimit, sortedExternalLabels)
 			if err != nil {
 				return err
 			}
-			for _, w := range ws {
+			for _, w := range warnings {
 				h.logger.Warn("Warnings on remote read query", "err", w.Error())
-			}
-			if len(sortedExternalLabels) > 0 {
-				for _, ts := range resp.Results[i].Timeseries {
-					ts.Labels = MergeLabels(ts.Labels, sortedExternalLabels)
-				}
 			}
 			return nil
 		}(); err != nil {
@@ -198,7 +191,7 @@ func (h *readHandler) remoteReadSamples(
 		}
 	}
 
-	if err := EncodeReadResponse(&resp, w); err != nil {
+	if err := writeReadResponse(resp.data, w); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

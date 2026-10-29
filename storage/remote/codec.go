@@ -15,6 +15,7 @@ package remote
 
 import (
 	"compress/gzip"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -94,9 +95,12 @@ func EncodeReadResponse(resp *prompb.ReadResponse, w http.ResponseWriter) error 
 	if err != nil {
 		return err
 	}
+	return writeReadResponse(data, w)
+}
 
+func writeReadResponse(data []byte, w http.ResponseWriter) error {
 	compressed := snappy.Encode(nil, data)
-	_, err = w.Write(compressed)
+	_, err := w.Write(compressed)
 	return err
 }
 
@@ -179,6 +183,225 @@ func ToQueryResult(ss storage.SeriesSet, sampleLimit int) (*prompb.QueryResult, 
 		})
 	}
 	return resp, ss.Warnings(), ss.Err()
+}
+
+// These are the length-delimited field tags used by the SAMPLES response messages.
+const (
+	readResponseResultTag  = 0x0a
+	queryResultSeriesTag   = 0x0a
+	timeSeriesLabelTag     = 0x0a
+	timeSeriesSampleTag    = 0x12
+	timeSeriesHistogramTag = 0x22
+)
+
+type sampledReadResponseEncoder struct {
+	data                    []byte
+	intHistogram            histogram.Histogram
+	floatHistogram          histogram.FloatHistogram
+	intHistogramProto       prompb.Histogram
+	intHistogramCount       prompb.Histogram_CountInt
+	intHistogramZeroCount   prompb.Histogram_ZeroCountInt
+	floatHistogramProto     prompb.Histogram
+	floatHistogramCount     prompb.Histogram_CountFloat
+	floatHistogramZeroCount prompb.Histogram_ZeroCountFloat
+}
+
+func (e *sampledReadResponseEncoder) appendQueryResult(
+	ss storage.SeriesSet,
+	sampleLimit int,
+	externalLabels []prompb.Label,
+) (annotations.Annotations, error) {
+	queryBodyStart := e.beginMessage(readResponseResultTag)
+	numSamples := 0
+	var iter chunkenc.Iterator
+
+	for ss.Next() {
+		series := ss.At()
+		seriesBodyStart := e.beginMessage(queryResultSeriesTag)
+		iter = series.Iterator(iter)
+
+		if err := e.appendLabels(series.Labels(), externalLabels); err != nil {
+			return ss.Warnings(), err
+		}
+
+		for valType := iter.Next(); valType != chunkenc.ValNone; valType = iter.Next() {
+			numSamples++
+			if sampleLimit > 0 && numSamples > sampleLimit {
+				return ss.Warnings(), HTTPError{
+					msg:    fmt.Sprintf("exceeded sample limit (%d)", sampleLimit),
+					status: http.StatusBadRequest,
+				}
+			}
+
+			var err error
+			switch valType {
+			case chunkenc.ValFloat:
+				ts, value := iter.At()
+				sample := prompb.Sample{Timestamp: ts, Value: value}
+				e.data, err = appendProtoMessage(e.data, timeSeriesSampleTag, &sample)
+			case chunkenc.ValHistogram:
+				// Use the returned histogram; stale samples may not fill the supplied target.
+				ts, h := iter.AtHistogram(&e.intHistogram)
+				hist := e.intHistogramMessage(ts, h)
+				// The message retains bucket slices, so serialize before the next iterator call.
+				e.data, err = appendProtoMessage(e.data, timeSeriesHistogramTag, hist)
+			case chunkenc.ValFloatHistogram:
+				// Use the returned histogram; stale samples may not fill the supplied target.
+				ts, fh := iter.AtFloatHistogram(&e.floatHistogram)
+				hist := e.floatHistogramMessage(ts, fh)
+				// The message retains bucket slices, so serialize before the next iterator call.
+				e.data, err = appendProtoMessage(e.data, timeSeriesHistogramTag, hist)
+			default:
+				return ss.Warnings(), fmt.Errorf("unrecognized value type: %s", valType)
+			}
+			if err != nil {
+				return ss.Warnings(), err
+			}
+		}
+		if err := iter.Err(); err != nil {
+			return ss.Warnings(), err
+		}
+
+		e.endMessage(seriesBodyStart)
+	}
+
+	warnings := ss.Warnings()
+	if err := ss.Err(); err != nil {
+		return warnings, err
+	}
+	e.endMessage(queryBodyStart)
+	return warnings, nil
+}
+
+// appendLabels encodes sorted series and external labels, preferring the series values.
+func (e *sampledReadResponseEncoder) appendLabels(seriesLabels labels.Labels, externalLabels []prompb.Label) error {
+	externalIndex := 0
+	var err error
+	seriesLabels.Range(func(l labels.Label) {
+		if err != nil {
+			return
+		}
+		for externalIndex < len(externalLabels) && externalLabels[externalIndex].Name < l.Name {
+			e.data, err = appendProtoMessage(e.data, timeSeriesLabelTag, &externalLabels[externalIndex])
+			externalIndex++
+			if err != nil {
+				return
+			}
+		}
+		if externalIndex < len(externalLabels) && externalLabels[externalIndex].Name == l.Name {
+			externalIndex++
+		}
+		label := prompb.Label{Name: l.Name, Value: l.Value}
+		e.data, err = appendProtoMessage(e.data, timeSeriesLabelTag, &label)
+	})
+	if err != nil {
+		return err
+	}
+	for ; externalIndex < len(externalLabels); externalIndex++ {
+		e.data, err = appendProtoMessage(e.data, timeSeriesLabelTag, &externalLabels[externalIndex])
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// intHistogramMessage mirrors prompb.FromIntHistogram while reusing its span slices.
+func (e *sampledReadResponseEncoder) intHistogramMessage(timestamp int64, h *histogram.Histogram) *prompb.Histogram {
+	negativeSpans := reuseHistogramSpans(e.intHistogramProto.NegativeSpans, h.NegativeSpans)
+	positiveSpans := reuseHistogramSpans(e.intHistogramProto.PositiveSpans, h.PositiveSpans)
+	e.intHistogramCount.CountInt = h.Count
+	e.intHistogramZeroCount.ZeroCountInt = h.ZeroCount
+	e.intHistogramProto = prompb.Histogram{
+		Count:          &e.intHistogramCount,
+		Sum:            h.Sum,
+		Schema:         h.Schema,
+		ZeroThreshold:  h.ZeroThreshold,
+		ZeroCount:      &e.intHistogramZeroCount,
+		NegativeSpans:  negativeSpans,
+		NegativeDeltas: h.NegativeBuckets,
+		PositiveSpans:  positiveSpans,
+		PositiveDeltas: h.PositiveBuckets,
+		ResetHint:      prompb.Histogram_ResetHint(h.CounterResetHint),
+		Timestamp:      timestamp,
+		CustomValues:   h.CustomValues,
+	}
+	return &e.intHistogramProto
+}
+
+// floatHistogramMessage mirrors prompb.FromFloatHistogram while reusing its span slices.
+func (e *sampledReadResponseEncoder) floatHistogramMessage(timestamp int64, h *histogram.FloatHistogram) *prompb.Histogram {
+	negativeSpans := reuseHistogramSpans(e.floatHistogramProto.NegativeSpans, h.NegativeSpans)
+	positiveSpans := reuseHistogramSpans(e.floatHistogramProto.PositiveSpans, h.PositiveSpans)
+	e.floatHistogramCount.CountFloat = h.Count
+	e.floatHistogramZeroCount.ZeroCountFloat = h.ZeroCount
+	e.floatHistogramProto = prompb.Histogram{
+		Count:          &e.floatHistogramCount,
+		Sum:            h.Sum,
+		Schema:         h.Schema,
+		ZeroThreshold:  h.ZeroThreshold,
+		ZeroCount:      &e.floatHistogramZeroCount,
+		NegativeSpans:  negativeSpans,
+		NegativeCounts: h.NegativeBuckets,
+		PositiveSpans:  positiveSpans,
+		PositiveCounts: h.PositiveBuckets,
+		ResetHint:      prompb.Histogram_ResetHint(h.CounterResetHint),
+		Timestamp:      timestamp,
+		CustomValues:   h.CustomValues,
+	}
+	return &e.floatHistogramProto
+}
+
+// reuseHistogramSpans copies model spans into a protobuf slice whose capacity is reused.
+func reuseHistogramSpans(dst []prompb.BucketSpan, src []histogram.Span) []prompb.BucketSpan {
+	dst = slices.Grow(dst[:0], len(src))
+	dst = dst[:len(src)]
+	for i, span := range src {
+		dst[i] = prompb.BucketSpan{Offset: span.Offset, Length: span.Length}
+	}
+	return dst
+}
+
+// beginMessage reserves the maximum varint width for a nested protobuf message length.
+func (e *sampledReadResponseEncoder) beginMessage(fieldTag byte) int {
+	e.data = append(e.data, fieldTag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	return len(e.data)
+}
+
+// endMessage writes the canonical length and shifts the body over unused reserved bytes.
+func (e *sampledReadResponseEncoder) endMessage(bodyStart int) {
+	var encodedLength [binary.MaxVarintLen64]byte
+	lengthSize := binary.PutUvarint(encodedLength[:], uint64(len(e.data)-bodyStart))
+	lengthStart := bodyStart - binary.MaxVarintLen64
+	copy(e.data[lengthStart+lengthSize:], e.data[bodyStart:])
+	copy(e.data[lengthStart:lengthStart+lengthSize], encodedLength[:lengthSize])
+	e.data = e.data[:len(e.data)-(binary.MaxVarintLen64-lengthSize)]
+}
+
+type protoMarshaler interface {
+	Size() int
+	MarshalTo([]byte) (int, error)
+}
+
+// appendProtoMessage appends one length-delimited protobuf message using its generated marshaler.
+func appendProtoMessage[T protoMarshaler](dst []byte, fieldTag byte, msg T) ([]byte, error) {
+	size := msg.Size()
+	dst = append(dst, fieldTag)
+	var encodedLength [binary.MaxVarintLen64]byte
+	lengthSize := binary.PutUvarint(encodedLength[:], uint64(size))
+	dst = append(dst, encodedLength[:lengthSize]...)
+
+	messageStart := len(dst)
+	dst = slices.Grow(dst, size)
+	dst = dst[:messageStart+size]
+	written, err := msg.MarshalTo(dst[messageStart:])
+	if err != nil {
+		return dst, err
+	}
+	if written != size {
+		return dst, fmt.Errorf("marshal %T wrote %d bytes, want %d", msg, written, size)
+	}
+	return dst, nil
 }
 
 // FromQueryResult unpacks and sorts a QueryResult proto.

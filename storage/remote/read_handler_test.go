@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -42,11 +43,13 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/promql/promqltest"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/prometheus/prometheus/util/teststorage"
 )
 
@@ -216,6 +219,315 @@ func TestSampledReadEndpoint(t *testing.T) {
 			}},
 		}, resp)
 	})
+}
+
+func TestSampledReadEndpointHistogramScratchOwnership(t *testing.T) {
+	const stepMs = int64(15_000)
+
+	store := teststorage.New(t)
+	app := store.AppenderV2(t.Context())
+	seriesLabels := map[string]labels.Labels{
+		"mixed":   labels.FromStrings("__name__", "sampled_read_ownership", "job", "local", "series", "mixed"),
+		"control": labels.FromStrings("__name__", "sampled_read_ownership", "series", "control"),
+	}
+	seriesRefs := make(map[string]storage.SeriesRef)
+	expectedSamples := make(map[string][]prompb.Sample)
+	expectedHistograms := make(map[string][]prompb.Histogram)
+	appendValue := func(series string, timestamp int64, value float64, h *histogram.Histogram, fh *histogram.FloatHistogram) {
+		ref, err := app.Append(seriesRefs[series], seriesLabels[series], 0, timestamp, value, h, fh, storage.AOptions{})
+		require.NoError(t, err)
+		seriesRefs[series] = ref
+	}
+	appendFloat := func(series string, timestamp int64, value float64) {
+		appendValue(series, timestamp, value, nil, nil)
+		expectedSamples[series] = append(expectedSamples[series], prompb.Sample{Timestamp: timestamp, Value: value})
+	}
+	appendIntHistogram := func(timestamp, sampleValue int64) {
+		actual := tsdbutil.GenerateTestHistogram(sampleValue)
+		want := tsdbutil.GenerateTestHistogram(sampleValue)
+		appendValue("mixed", timestamp, 0, actual, nil)
+		expectedHistograms["mixed"] = append(expectedHistograms["mixed"], prompb.FromIntHistogram(timestamp, want))
+	}
+	appendStaleIntHistogram := func(timestamp int64) {
+		actual := tsdbutil.GenerateTestHistogram(4)
+		actual.Sum = math.Float64frombits(value.StaleNaN)
+		appendValue("mixed", timestamp, 0, actual, nil)
+		want := &histogram.Histogram{Sum: math.Float64frombits(value.StaleNaN)}
+		expectedHistograms["mixed"] = append(expectedHistograms["mixed"], prompb.FromIntHistogram(timestamp, want))
+	}
+	appendFloatHistogram := func(timestamp, sampleValue int64) {
+		actual := tsdbutil.GenerateTestFloatHistogram(sampleValue)
+		want := tsdbutil.GenerateTestFloatHistogram(sampleValue)
+		appendValue("mixed", timestamp, 0, nil, actual)
+		expectedHistograms["mixed"] = append(expectedHistograms["mixed"], prompb.FromFloatHistogram(timestamp, want))
+	}
+	appendStaleFloatHistogram := func(timestamp int64) {
+		actual := tsdbutil.GenerateTestFloatHistogram(4)
+		actual.Sum = math.Float64frombits(value.StaleNaN)
+		appendValue("mixed", timestamp, 0, nil, actual)
+		want := &histogram.FloatHistogram{Sum: math.Float64frombits(value.StaleNaN)}
+		expectedHistograms["mixed"] = append(expectedHistograms["mixed"], prompb.FromFloatHistogram(timestamp, want))
+	}
+	appendCustomFloatHistogram := func(timestamp, value int64) {
+		actual := tsdbutil.GenerateTestCustomBucketsFloatHistogram(value)
+		want := tsdbutil.GenerateTestCustomBucketsFloatHistogram(value)
+		appendValue("mixed", timestamp, 0, nil, actual)
+		expectedHistograms["mixed"] = append(expectedHistograms["mixed"], prompb.FromFloatHistogram(timestamp, want))
+	}
+
+	appendFloat("mixed", 0, 0)
+	appendIntHistogram(stepMs, 1)
+	appendStaleIntHistogram(2 * stepMs)
+	appendIntHistogram(3*stepMs, 3)
+	appendFloatHistogram(4*stepMs, 2)
+	appendStaleFloatHistogram(5 * stepMs)
+	appendCustomFloatHistogram(6*stepMs, 3)
+	appendFloat("mixed", 7*stepMs, 42)
+	appendFloat("control", 0, 7)
+	if err := app.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	matcher, err := labels.NewMatcher(labels.MatchEqual, "__name__", "sampled_read_ownership")
+	require.NoError(t, err)
+	end := 7 * stepMs
+	querier, err := store.Querier(0, end)
+	require.NoError(t, err)
+	seriesSet := querier.Select(t.Context(), false, nil, matcher)
+	var seriesOrder []string
+	for seriesSet.Next() {
+		seriesOrder = append(seriesOrder, seriesSet.At().Labels().Get("series"))
+	}
+	require.NoError(t, seriesSet.Err())
+	require.NoError(t, querier.Close())
+
+	query, err := ToQuery(0, end, []*labels.Matcher{matcher}, nil)
+	require.NoError(t, err)
+	emptyMatcher, err := labels.NewMatcher(labels.MatchEqual, "__name__", "no_samples")
+	require.NoError(t, err)
+	emptyQuery, err := ToQuery(0, end, []*labels.Matcher{emptyMatcher}, nil)
+	require.NoError(t, err)
+	externalLabels := labels.FromStrings("job", "remote", "zone", "west")
+	externalLabelProtos := prompb.FromLabels(externalLabels, nil)
+	cfg := config.Config{GlobalConfig: config.GlobalConfig{ExternalLabels: externalLabels}}
+	requestBytes, err := proto.Marshal(&prompb.ReadRequest{
+		Queries:               []*prompb.Query{query, emptyQuery, query},
+		AcceptedResponseTypes: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_SAMPLES},
+	})
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/read", bytes.NewReader(snappy.Encode(nil, requestBytes)))
+	handler := NewReadHandler(nil, nil, store, func() config.Config { return cfg }, 1_000_000, 1, 0)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	decoded, err := snappy.Decode(nil, recorder.Body.Bytes())
+	require.NoError(t, err)
+	var response prompb.ReadResponse
+	require.NoError(t, proto.Unmarshal(decoded, &response))
+
+	buildExpectedQueryResult := func() *prompb.QueryResult {
+		result := &prompb.QueryResult{}
+		for _, series := range seriesOrder {
+			result.Timeseries = append(result.Timeseries, &prompb.TimeSeries{
+				Labels:     MergeLabels(prompb.FromLabels(seriesLabels[series], nil), externalLabelProtos),
+				Samples:    append([]prompb.Sample(nil), expectedSamples[series]...),
+				Histograms: append([]prompb.Histogram(nil), expectedHistograms[series]...),
+			})
+		}
+		return result
+	}
+	want := &prompb.ReadResponse{Results: []*prompb.QueryResult{buildExpectedQueryResult(), {}, buildExpectedQueryResult()}}
+	encodedWant, err := proto.Marshal(want)
+	require.NoError(t, err)
+	encodedResponse, err := proto.Marshal(&response)
+	require.NoError(t, err)
+	require.Equal(t, encodedWant, encodedResponse)
+}
+
+func TestSampledReadEndpointSampleLimitAndLateErrors(t *testing.T) {
+	t.Run("sample limit resets for each query and withholds a successful prefix", func(t *testing.T) {
+		store := teststorage.New(t)
+		app := store.AppenderV2(t.Context())
+		oneSampleLabels := labels.FromStrings("__name__", "single_sample", "series", "one")
+		_, err := app.Append(0, oneSampleLabels, 0, 0, 1, nil, nil, storage.AOptions{})
+		require.NoError(t, err)
+		multipleSampleLabels := labels.FromStrings("__name__", "multiple_samples", "series", "many")
+		ref, err := app.Append(0, multipleSampleLabels, 0, 0, 1, nil, nil, storage.AOptions{})
+		require.NoError(t, err)
+		_, err = app.Append(ref, multipleSampleLabels, 0, 1, 2, nil, nil, storage.AOptions{})
+		require.NoError(t, err)
+		require.NoError(t, app.Commit())
+
+		queryForMetric := func(name string) *prompb.Query {
+			matcher, err := labels.NewMatcher(labels.MatchEqual, "__name__", name)
+			require.NoError(t, err)
+			query, err := ToQuery(0, 1, []*labels.Matcher{matcher}, nil)
+			require.NoError(t, err)
+			return query
+		}
+		oneSampleQuery := queryForMetric("single_sample")
+		multipleSamplesQuery := queryForMetric("multiple_samples")
+		handler := NewReadHandler(nil, nil, store, func() config.Config { return config.Config{} }, 1, 1, 0)
+		makeRequest := func(queries ...*prompb.Query) *http.Request {
+			data, err := proto.Marshal(&prompb.ReadRequest{Queries: queries})
+			require.NoError(t, err)
+			return httptest.NewRequest(http.MethodPost, "/api/v1/read", bytes.NewReader(snappy.Encode(nil, data)))
+		}
+
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, makeRequest(oneSampleQuery, oneSampleQuery))
+		require.Equal(t, http.StatusOK, recorder.Code)
+		decoded, err := snappy.Decode(nil, recorder.Body.Bytes())
+		require.NoError(t, err)
+		var response prompb.ReadResponse
+		require.NoError(t, proto.Unmarshal(decoded, &response))
+		require.Len(t, response.Results, 2)
+		require.Len(t, response.Results[0].Timeseries, 1)
+		require.Len(t, response.Results[1].Timeseries, 1)
+		require.Len(t, response.Results[0].Timeseries[0].Samples, 1)
+		require.Len(t, response.Results[1].Timeseries[0].Samples, 1)
+
+		recorder = httptest.NewRecorder()
+		handler.ServeHTTP(recorder, makeRequest(oneSampleQuery, multipleSamplesQuery))
+		require.Equal(t, http.StatusBadRequest, recorder.Code)
+		require.Equal(t, "text/plain; charset=utf-8", recorder.Header().Get("Content-Type"))
+		require.Equal(t, "exceeded sample limit (1)\n", recorder.Body.String())
+	})
+
+	t.Run("iterator, series-set and unknown-value errors do not publish a prefix", func(t *testing.T) {
+		for _, tc := range []struct {
+			name          string
+			values        []chunkenc.ValueType
+			iteratorError error
+			setError      error
+			wantError     string
+		}{
+			{name: "iterator", values: []chunkenc.ValueType{chunkenc.ValFloat}, iteratorError: errors.New("iterator failed"), wantError: "iterator failed"},
+			{name: "series set", values: []chunkenc.ValueType{chunkenc.ValFloat}, setError: errors.New("series set failed"), wantError: "series set failed"},
+			{name: "unknown value", values: []chunkenc.ValueType{chunkenc.ValueType(99)}, wantError: "unrecognized value type: unknown"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var logBuffer bytes.Buffer
+				firstWarning := errors.New("first query warning")
+				failingWarning := errors.New("failing query warning")
+				queryable := &sampledReadTestQueryable{seriesSets: []storage.SeriesSet{
+					newSampledReadTestSeriesSet([]chunkenc.ValueType{chunkenc.ValFloat}, nil, nil, firstWarning),
+					newSampledReadTestSeriesSet(tc.values, tc.iteratorError, tc.setError, failingWarning),
+				}}
+				handler := NewReadHandler(slog.New(slog.NewTextHandler(&logBuffer, nil)), nil, queryable, func() config.Config {
+					return config.Config{}
+				}, 0, 1, 0)
+				requestBytes, err := proto.Marshal(&prompb.ReadRequest{Queries: []*prompb.Query{{}, {}}})
+				require.NoError(t, err)
+				request := httptest.NewRequest(http.MethodPost, "/api/v1/read", bytes.NewReader(snappy.Encode(nil, requestBytes)))
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, request)
+				require.Equal(t, http.StatusInternalServerError, recorder.Code)
+				require.Equal(t, "text/plain; charset=utf-8", recorder.Header().Get("Content-Type"))
+				require.Equal(t, tc.wantError+"\n", recorder.Body.String())
+				require.Contains(t, logBuffer.String(), firstWarning.Error())
+				require.NotContains(t, logBuffer.String(), failingWarning.Error())
+			})
+		}
+	})
+}
+
+type sampledReadTestQueryable struct {
+	storage.SampleAndChunkQueryable
+	seriesSets []storage.SeriesSet
+	nextSet    int
+}
+
+func (q *sampledReadTestQueryable) Querier(int64, int64) (storage.Querier, error) {
+	seriesSet := q.seriesSets[q.nextSet]
+	q.nextSet++
+	return &storage.MockQuerier{
+		SelectMockFunction: func(bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
+			return seriesSet
+		},
+	}, nil
+}
+
+type sampledReadTestSeries struct {
+	seriesLabels labels.Labels
+	iterator     chunkenc.Iterator
+}
+
+func (s *sampledReadTestSeries) Labels() labels.Labels {
+	return s.seriesLabels
+}
+
+func (s *sampledReadTestSeries) Iterator(chunkenc.Iterator) chunkenc.Iterator {
+	return s.iterator
+}
+
+type sampledReadTestSeriesSet struct {
+	series   storage.Series
+	warnings annotations.Annotations
+	err      error
+	returned bool
+}
+
+func newSampledReadTestSeriesSet(values []chunkenc.ValueType, iteratorError, setError, warning error) storage.SeriesSet {
+	warnings := annotations.Annotations{}
+	if warning != nil {
+		warnings[warning.Error()] = warning
+	}
+	return &sampledReadTestSeriesSet{
+		series: &sampledReadTestSeries{
+			seriesLabels: labels.FromStrings("__name__", "test_metric", "series", "test"),
+			iterator: &sampledReadTestIterator{
+				values: values,
+				err:    iteratorError,
+				index:  -1,
+			},
+		},
+		warnings: warnings,
+		err:      setError,
+	}
+}
+
+func (s *sampledReadTestSeriesSet) Next() bool {
+	if s.returned {
+		return false
+	}
+	s.returned = true
+	return true
+}
+
+func (s *sampledReadTestSeriesSet) At() storage.Series {
+	return s.series
+}
+
+func (s *sampledReadTestSeriesSet) Err() error {
+	return s.err
+}
+
+func (s *sampledReadTestSeriesSet) Warnings() annotations.Annotations {
+	return s.warnings
+}
+
+type sampledReadTestIterator struct {
+	chunkenc.Iterator
+	values []chunkenc.ValueType
+	err    error
+	index  int
+}
+
+func (it *sampledReadTestIterator) Next() chunkenc.ValueType {
+	it.index++
+	if it.index >= len(it.values) {
+		return chunkenc.ValNone
+	}
+	return it.values[it.index]
+}
+
+func (it *sampledReadTestIterator) At() (int64, float64) {
+	return int64(it.index), float64(it.index + 1)
+}
+
+func (it *sampledReadTestIterator) Err() error {
+	return it.err
 }
 
 func BenchmarkSampledReadEndpointWithoutExternalLabels(b *testing.B) {
