@@ -18,6 +18,7 @@ package textparse
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -26,7 +27,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/model/exemplar"
@@ -103,8 +103,8 @@ type OpenMetricsParser struct {
 	hasExemplarTs bool
 
 	// Start timestamp parsing state.
-	st        int64
-	stHashSet uint64
+	st         int64
+	stIdentity []byte // Exact identity for the cached start timestamp.
 	// ignoreExemplar instructs the parser to not overwrite exemplars (to keep them while peeking ahead).
 	ignoreExemplar bool
 	// visitedMFName is the metric family name of the last visited metric when peeking ahead
@@ -290,14 +290,12 @@ func (p *OpenMetricsParser) Exemplar(e *exemplar.Exemplar) bool {
 func (p *OpenMetricsParser) StartTimestamp() int64 {
 	if !typeRequiresST(p.mtype) {
 		// Not a ST supported metric type, fast path.
-		p.stHashSet = 0 // Use stHashSet as a single way of telling "empty cache"
+		p.st = 0
+		p.stIdentity = p.stIdentity[:0]
 		return 0
 	}
 
-	var (
-		buf      []byte
-		currName []byte
-	)
+	var currName []byte
 	if len(p.series) > 1 && p.series[0] == '{' && p.series[1] == '"' {
 		// special case for UTF-8 encoded metric family names.
 		currName = p.series[p.offsets[0]-p.start : p.mfNameLen+2]
@@ -305,11 +303,16 @@ func (p *OpenMetricsParser) StartTimestamp() int64 {
 		currName = p.series[p.offsets[0]-p.start : p.mfNameLen]
 	}
 
-	currHash := p.seriesHash(&buf, currName)
+	currIdentity := p.seriesIdentity(nil, currName)
 	// Check cache, perhaps we fetched something already.
-	if currHash == p.stHashSet && p.st > 0 {
+	if p.st > 0 && bytes.Equal(currIdentity, p.stIdentity) {
 		return p.st
 	}
+
+	// Keep the current identity while reusing its temporary buffer for lookahead identities.
+	p.st = 0
+	p.stIdentity = append(p.stIdentity[:0], currIdentity...)
+	identityScratch := currIdentity[:0]
 
 	// Create a new lexer and other core state details to reset the parser once this function is done executing.
 	resetLexer := &openMetricsLexer{
@@ -354,8 +357,8 @@ func (p *OpenMetricsParser) StartTimestamp() int64 {
 		}
 
 		// Remove _created suffix.
-		peekedHash := p.seriesHash(&buf, peekedName[:len(peekedName)-8])
-		if peekedHash != currHash {
+		identityScratch = p.seriesIdentity(identityScratch, peekedName[:len(peekedName)-8])
+		if !bytes.Equal(identityScratch, p.stIdentity) {
 			// Found ST line for a different series, for our series no ST.
 			p.resetSTParseValues()
 			return 0
@@ -364,7 +367,7 @@ func (p *OpenMetricsParser) StartTimestamp() int64 {
 		// All timestamps in OpenMetrics are Unix Epoch in seconds. Convert to milliseconds.
 		// https://github.com/prometheus/OpenMetrics/blob/v1.0.0/specification/OpenMetrics.md#timestamps
 		st := int64(p.val * 1000.0)
-		p.setSTParseValues(st, currHash, currName, true)
+		p.setSTParseValues(st, currName, true)
 		return st
 	}
 }
@@ -374,48 +377,74 @@ var (
 	quantileBytes = []byte{113, 117, 97, 110, 116, 105, 108, 101}
 )
 
-// seriesHash generates a hash based on the metric family name and the offsets
-// of label names and values from the parsed OpenMetrics data. It skips quantile
-// and le labels for summaries and histograms respectively.
-func (p *OpenMetricsParser) seriesHash(offsetsArr *[]byte, metricFamilyName []byte) uint64 {
-	// Iterate through p.offsets to find the label names and values.
+// This reports whether a label is intentionally excluded from the start-timestamp identity.
+func (p *OpenMetricsParser) skipSTIdentityLabel(label []byte) bool {
+	return (p.mtype == model.MetricTypeSummary && bytes.Equal(label, quantileBytes)) ||
+		(p.mtype == model.MetricTypeHistogram && bytes.Equal(label, leBytes))
+}
+
+// This helper encodes the family name and label pairs without ambiguity.
+func (p *OpenMetricsParser) seriesIdentity(identity, metricFamilyName []byte) []byte {
+	var (
+		labelCount  int
+		identityLen int
+		varint      [binary.MaxVarintLen64]byte
+	)
+	identityLen = binary.PutUvarint(varint[:], uint64(len(metricFamilyName))) + len(metricFamilyName)
 	for i := 2; i < len(p.offsets); i += 4 {
 		lStart := p.offsets[i] - p.start
 		lEnd := p.offsets[i+1] - p.start
 		label := p.series[lStart:lEnd]
-		// Skip quantile and le labels for summaries and histograms.
-		if p.mtype == model.MetricTypeSummary && bytes.Equal(label, quantileBytes) {
+		if p.skipSTIdentityLabel(label) {
 			continue
 		}
-		if p.mtype == model.MetricTypeHistogram && bytes.Equal(label, leBytes) {
-			continue
-		}
-		*offsetsArr = append(*offsetsArr, p.series[lStart:lEnd]...)
 		vStart := p.offsets[i+2] - p.start
 		vEnd := p.offsets[i+3] - p.start
-		*offsetsArr = append(*offsetsArr, p.series[vStart:vEnd]...)
+		labelCount++
+		identityLen += binary.PutUvarint(varint[:], uint64(lEnd-lStart)) + lEnd - lStart
+		identityLen += binary.PutUvarint(varint[:], uint64(vEnd-vStart)) + vEnd - vStart
+	}
+	identityLen += binary.PutUvarint(varint[:], uint64(labelCount))
+	if cap(identity)-len(identity) < identityLen {
+		grown := make([]byte, len(identity), len(identity)+identityLen)
+		copy(grown, identity)
+		identity = grown
 	}
 
-	*offsetsArr = append(*offsetsArr, metricFamilyName...)
-	hashedOffsets := xxhash.Sum64(*offsetsArr)
+	identity = binary.AppendUvarint(identity, uint64(len(metricFamilyName)))
+	identity = append(identity, metricFamilyName...)
+	identity = binary.AppendUvarint(identity, uint64(labelCount))
 
-	// Reset the offsets array for later reuse.
-	*offsetsArr = (*offsetsArr)[:0]
-	return hashedOffsets
+	for i := 2; i < len(p.offsets); i += 4 {
+		lStart := p.offsets[i] - p.start
+		lEnd := p.offsets[i+1] - p.start
+		label := p.series[lStart:lEnd]
+		if p.skipSTIdentityLabel(label) {
+			continue
+		}
+		identity = binary.AppendUvarint(identity, uint64(lEnd-lStart))
+		identity = append(identity, p.series[lStart:lEnd]...)
+		vStart := p.offsets[i+2] - p.start
+		vEnd := p.offsets[i+3] - p.start
+		identity = binary.AppendUvarint(identity, uint64(vEnd-vStart))
+		identity = append(identity, p.series[vStart:vEnd]...)
+	}
+
+	return identity
 }
 
 // setSTParseValues sets the parser to the state after StartTimestamp method was called and ST was found.
 // This is useful to prevent re-parsing the same series again and early return the ST value.
-func (p *OpenMetricsParser) setSTParseValues(st int64, stHashSet uint64, mfName []byte, skipSTSeries bool) {
+func (p *OpenMetricsParser) setSTParseValues(st int64, mfName []byte, skipSTSeries bool) {
 	p.st = st
-	p.stHashSet = stHashSet
 	p.visitedMFName = mfName
 	p.skipSTSeries = skipSTSeries // Do we need to set it?
 }
 
 // resetSTParseValues resets the parser to the state before StartTimestamp method was called.
 func (p *OpenMetricsParser) resetSTParseValues() {
-	p.stHashSet = 0
+	p.st = 0
+	p.stIdentity = p.stIdentity[:0]
 	p.skipSTSeries = true
 }
 
