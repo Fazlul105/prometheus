@@ -22,6 +22,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -2438,12 +2439,89 @@ func TestGCSeriesAccess(t *testing.T) {
 	require.Equal(t, storage.ErrNotFound, err)
 }
 
+func histogramRecordWithPositiveSpanCount(rec []byte, count uint64) []byte {
+	dec := encoding.Decbuf{B: rec}
+	switch record.Type(dec.Byte()) {
+	case record.HistogramSamples, record.CustomBucketsHistogramSamples:
+		dec.Be64()
+		dec.Be64()
+		dec.Varint64()
+		dec.Varint64()
+	case record.HistogramSamplesV2:
+		dec.Varint64()
+		dec.Varint64()
+		dec.Varint64()
+	default:
+		panic("unexpected histogram record type")
+	}
+	dec.Byte()
+	dec.Varint64()
+	dec.Be64()
+	dec.Uvarint64()
+	dec.Uvarint64()
+	dec.Be64()
+	offset := len(rec) - dec.Len()
+	if offset >= len(rec) || rec[offset] != 0 {
+		panic("expected an empty positive-span vector")
+	}
+	var encodedLength encoding.Encbuf
+	encodedLength.PutUvarint64(count)
+	out := make([]byte, 0, len(rec)-1+len(encodedLength.B))
+	out = append(out, rec[:offset]...)
+	out = append(out, encodedLength.B...)
+	out = append(out, rec[offset+1:]...)
+	return out
+}
+
+func TestHeadInitRejectsMalformedHistogramLengthInSubprocess(t *testing.T) {
+	const childEnv = "PROMETHEUS_TEST_MALFORMED_HISTOGRAM_WAL_CHILD"
+	if os.Getenv(childEnv) == "1" {
+		dir := t.TempDir()
+		wal, err := wlog.New(nil, nil, filepath.Join(dir, "wal"), compression.None)
+		require.NoError(t, err)
+
+		enc := record.Encoder{}
+		rec, leftover := enc.HistogramSamples([]record.RefHistogramSample{{
+			Ref: 1,
+			T:   99,
+			H:   &histogram.Histogram{Schema: 1},
+		}}, nil)
+		require.Empty(t, leftover)
+		require.NoError(t, wal.Log(histogramRecordWithPositiveSpanCount(rec, uint64(1)<<62)))
+
+		opts := DefaultHeadOptions()
+		opts.ChunkRange = 1
+		opts.ChunkDirRoot = wal.Dir()
+		h, err := NewHead(nil, nil, wal, nil, opts, nil)
+		require.NoError(t, err)
+		initErr := h.Init(math.MinInt64)
+		var corruptionErr *wlog.CorruptionErr
+		require.ErrorAs(t, initErr, &corruptionErr)
+		require.ErrorIs(t, initErr, encoding.ErrInvalidSize)
+		require.NoError(t, h.Close())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestHeadInitRejectsMalformedHistogramLengthInSubprocess$")
+	cmd.Env = append(os.Environ(), childEnv+"=1")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "child did not return the WAL corruption error: %s", output)
+}
+
 // TestWalRepair_DecodingError ensures that a repair is run for an error
 // when decoding a record.
 func TestWalRepair_DecodingError(t *testing.T) {
 	t.Parallel()
 	for _, enableSTStorage := range []bool{false, true} {
 		enc := record.Encoder{EnableSTStorage: enableSTStorage}
+		histogramRecord, leftover := enc.HistogramSamples([]record.RefHistogramSample{{
+			Ref: 1,
+			T:   99,
+			H:   &histogram.Histogram{Schema: 1},
+		}}, nil)
+		require.Empty(t, leftover)
 		for name, test := range map[string]struct {
 			corrFunc  func(rec []byte) []byte // Func that applies the corruption to a record.
 			rec       []byte
@@ -2463,6 +2541,14 @@ func TestWalRepair_DecodingError(t *testing.T) {
 					return rec[:3]
 				},
 				enc.Samples([]record.RefSample{{Ref: 0, T: 99, V: 1}}, []byte{}),
+				9,
+				5,
+			},
+			"decode_histogram_length": {
+				func(rec []byte) []byte {
+					return histogramRecordWithPositiveSpanCount(rec, uint64(^uint(0)>>1)+1)
+				},
+				histogramRecord,
 				9,
 				5,
 			},
