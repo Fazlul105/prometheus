@@ -195,7 +195,10 @@ const (
 )
 
 type sampledReadResponseEncoder struct {
-	data                    []byte
+	data []byte
+	// These scalar messages are marshaled before their scratch fields are reused.
+	labelProto              prompb.Label
+	sampleProto             prompb.Sample
 	intHistogram            histogram.Histogram
 	floatHistogram          histogram.FloatHistogram
 	intHistogramProto       prompb.Histogram
@@ -237,8 +240,9 @@ func (e *sampledReadResponseEncoder) appendQueryResult(
 			switch valType {
 			case chunkenc.ValFloat:
 				ts, value := iter.At()
-				sample := prompb.Sample{Timestamp: ts, Value: value}
-				e.data, err = appendProtoMessage(e.data, timeSeriesSampleTag, &sample)
+				e.sampleProto.Timestamp = ts
+				e.sampleProto.Value = value
+				e.data, err = appendProtoMessage(e.data, timeSeriesSampleTag, &e.sampleProto)
 			case chunkenc.ValHistogram:
 				// Use the returned histogram; stale samples may not fill the supplied target.
 				ts, h := iter.AtHistogram(&e.intHistogram)
@@ -291,8 +295,9 @@ func (e *sampledReadResponseEncoder) appendLabels(seriesLabels labels.Labels, ex
 		if externalIndex < len(externalLabels) && externalLabels[externalIndex].Name == l.Name {
 			externalIndex++
 		}
-		label := prompb.Label{Name: l.Name, Value: l.Value}
-		e.data, err = appendProtoMessage(e.data, timeSeriesLabelTag, &label)
+		e.labelProto.Name = l.Name
+		e.labelProto.Value = l.Value
+		e.data, err = appendProtoMessage(e.data, timeSeriesLabelTag, &e.labelProto)
 	})
 	if err != nil {
 		return err
