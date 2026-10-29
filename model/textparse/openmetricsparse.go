@@ -387,10 +387,9 @@ func (p *OpenMetricsParser) skipSTIdentityLabel(label []byte) bool {
 		(p.mtype == model.MetricTypeHistogram && bytes.Equal(label, leBytes))
 }
 
-// This helper encodes the family name and label pairs without ambiguity.
+// This helper encodes the family name and each label name/value with explicit lengths.
 func (p *OpenMetricsParser) seriesIdentity(identity, metricFamilyName []byte) []byte {
 	var (
-		labelCount  int
 		identityLen int
 		varint      [binary.MaxVarintLen64]byte
 	)
@@ -404,11 +403,9 @@ func (p *OpenMetricsParser) seriesIdentity(identity, metricFamilyName []byte) []
 		}
 		vStart := p.offsets[i+2] - p.start
 		vEnd := p.offsets[i+3] - p.start
-		labelCount++
 		identityLen += binary.PutUvarint(varint[:], uint64(lEnd-lStart)) + lEnd - lStart
 		identityLen += binary.PutUvarint(varint[:], uint64(vEnd-vStart)) + vEnd - vStart
 	}
-	identityLen += binary.PutUvarint(varint[:], uint64(labelCount))
 	if cap(identity)-len(identity) < identityLen {
 		grown := make([]byte, len(identity), len(identity)+identityLen)
 		copy(grown, identity)
@@ -417,7 +414,6 @@ func (p *OpenMetricsParser) seriesIdentity(identity, metricFamilyName []byte) []
 
 	identity = binary.AppendUvarint(identity, uint64(len(metricFamilyName)))
 	identity = append(identity, metricFamilyName...)
-	identity = binary.AppendUvarint(identity, uint64(labelCount))
 
 	for i := 2; i < len(p.offsets); i += 4 {
 		lStart := p.offsets[i] - p.start
