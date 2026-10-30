@@ -474,7 +474,7 @@ func testOOOHeadChunkReader_LabelValues(t *testing.T, scenario sampleTypeScenari
 			require.NoError(t, err)
 			require.Equal(t, tc.expValues4, values)
 
-			// bar1 is an earlier candidate but does not match the other-label selector.
+			// The earlier bar1 candidate does not match the other-label selector.
 			values, err = oh.LabelValues(ctx, "foo", &storage.LabelHints{Limit: 1}, labels.MustNewMatcher(labels.MatchEqual, "job", "api"))
 			sort.Strings(values)
 			require.NoError(t, err)

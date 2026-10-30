@@ -958,6 +958,12 @@ func findIntersectingPostings(p Postings, candidates []Postings, limit int) (ind
 	for idx, it := range candidates {
 		switch {
 		case it.Next():
+			// A merged iterator can yield a reference and still retain a child error.
+			if limit > 0 {
+				if err := it.Err(); err != nil {
+					return nil, err
+				}
+			}
 			h = append(h, postingsWithIndex{index: idx, p: it})
 		case it.Err() != nil:
 			return nil, it.Err()
@@ -974,10 +980,12 @@ func findIntersectingPostings(p Postings, candidates []Postings, limit int) (ind
 		}
 		if p.At() == h.at() {
 			if limit > 0 && len(indexes)+1 == limit {
-				return append(indexes, h[0].index), nil
+				indexes = append(indexes, h[0].index)
+				// The matcher iterator may retain an error with its current reference.
+				return indexes, p.Err()
 			}
 			indexes = append(indexes, h.popIndex())
-		} else if err := h.seekHead(p.At()); err != nil {
+		} else if err := h.seekHead(p.At(), limit > 0); err != nil {
 			return nil, err
 		}
 	}
@@ -1021,18 +1029,21 @@ func (h *postingsWithIndexHeap) popIndex() int {
 func (h postingsWithIndexHeap) at() storage.SeriesRef { return h[0].p.At() }
 
 // seekHead performs the Postings.Seek() operation on the root of the heap.
-// If the root is exhausted or fails, it is removed from the heap.
-func (h *postingsWithIndexHeap) seekHead(val storage.SeriesRef) error {
+// If the root is exhausted or fails, it is removed from the heap. Bounded callers
+// also check errors retained by successful seeks before stopping early.
+func (h *postingsWithIndexHeap) seekHead(val storage.SeriesRef, checkErrOnSuccess bool) error {
 	pi := (*h)[0]
 	next := pi.p.Seek(val)
+	if !next || checkErrOnSuccess {
+		if err := pi.p.Err(); err != nil {
+			return fmt.Errorf("seek postings %d: %w", pi.index, err)
+		}
+	}
 	if next {
 		heap.Fix(h, 0)
 		return nil
 	}
 
-	if err := pi.p.Err(); err != nil {
-		return fmt.Errorf("seek postings %d: %w", pi.index, err)
-	}
 	h.popIndex()
 	return nil
 }

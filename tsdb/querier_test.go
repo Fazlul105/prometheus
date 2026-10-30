@@ -2972,6 +2972,76 @@ func BenchmarkSetMatcher(b *testing.B) {
 	}
 }
 
+type mockIndexWithRecordedPostingsError struct {
+	mockIndex
+	matcherPostings   index.Postings
+	candidatePostings map[string]index.Postings
+}
+
+func (m mockIndexWithRecordedPostingsError) Postings(ctx context.Context, name string, values ...string) (index.Postings, error) {
+	if name == "job" {
+		return m.matcherPostings, nil
+	}
+	if name == "pod" && len(values) == 1 {
+		if p, ok := m.candidatePostings[values[0]]; ok {
+			return p, nil
+		}
+	}
+	return m.mockIndex.Postings(ctx, name, values...)
+}
+
+func (m mockIndexWithRecordedPostingsError) SortedLabelValues(ctx context.Context, name string, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, error) {
+	values, err := labelValuesWithMatchers(ctx, m, name, hints, matchers...)
+	if err == nil {
+		sort.Strings(values)
+	}
+	return values, err
+}
+
+func TestLabelValuesWithMatchersPropagatesRecordedPostingsErrors(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name              string
+		matcherPostings   index.Postings
+		candidatePostings map[string]index.Postings
+		podARef           storage.SeriesRef
+		podBRef           storage.SeriesRef
+	}{
+		{
+			name:            "matcher iterator retains an error while yielding the limiting hit",
+			matcherPostings: index.Merge(ctx, index.ErrPostings(context.Canceled), index.NewListPostings([]storage.SeriesRef{1})),
+			podARef:         1,
+			podBRef:         2,
+		},
+		{
+			name:            "candidate iterator retains an error while yielding a reference",
+			matcherPostings: index.NewListPostings([]storage.SeriesRef{1, 3}),
+			candidatePostings: map[string]index.Postings{
+				"a": index.Merge(ctx, index.ErrPostings(context.Canceled), index.NewListPostings([]storage.SeriesRef{2})),
+			},
+			podARef: 2,
+			podBRef: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ix := newMockIndex()
+			require.NoError(t, ix.WritePostings("pod", "a", index.NewListPostings([]storage.SeriesRef{tc.podARef})))
+			require.NoError(t, ix.WritePostings("pod", "b", index.NewListPostings([]storage.SeriesRef{tc.podBRef})))
+			reader := mockIndexWithRecordedPostingsError{
+				mockIndex:         ix,
+				matcherPostings:   tc.matcherPostings,
+				candidatePostings: tc.candidatePostings,
+			}
+			q := &blockBaseQuerier{index: reader}
+
+			got, _, err := q.LabelValues(ctx, "pod", &storage.LabelHints{Limit: 1}, labels.MustNewMatcher(labels.MatchEqual, "job", "api"))
+			require.ErrorIs(t, err, context.Canceled)
+			require.ErrorContains(t, err, "intersecting postings")
+			require.Nil(t, got)
+		})
+	}
+}
+
 func TestPostingsForMatchers(t *testing.T) {
 	ctx := context.Background()
 

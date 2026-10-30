@@ -1155,6 +1155,55 @@ func TestFindIntersectingPostings(t *testing.T) {
 		require.Equal(t, []int{1, 3}, indexes)
 	})
 
+	t.Run("matcher error recorded on the limiting hit is returned", func(t *testing.T) {
+		p := Merge(context.Background(), ErrPostings(context.Canceled), NewListPostings([]storage.SeriesRef{10}))
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{10}),
+			NewListPostings([]storage.SeriesRef{20}),
+		}
+
+		indexes, err := FindIntersectingPostingsWithLimit(p, candidates, 1)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, []int{0}, indexes)
+	})
+
+	t.Run("matcher error recorded by a successful seek is returned", func(t *testing.T) {
+		p := Merge[Postings](context.Background(),
+			&postingsFailingAfterNthCall{2, NewListPostings([]storage.SeriesRef{1, 2})},
+			NewListPostings([]storage.SeriesRef{3}),
+		)
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{3}),
+			NewListPostings([]storage.SeriesRef{4}),
+		}
+
+		_, err := FindIntersectingPostingsWithLimit(p, candidates, 1)
+		require.EqualError(t, err, "ttl exceeded")
+	})
+
+	t.Run("candidate error recorded while yielding a reference is returned", func(t *testing.T) {
+		p := NewListPostings([]storage.SeriesRef{10, 30})
+		candidates := []Postings{
+			Merge(context.Background(), ErrPostings(context.Canceled), NewListPostings([]storage.SeriesRef{20})),
+			NewListPostings([]storage.SeriesRef{10}),
+		}
+
+		_, err := FindIntersectingPostingsWithLimit(p, candidates, 1)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("candidate error recorded by a successful seek is returned", func(t *testing.T) {
+		candidate := Merge[Postings](context.Background(),
+			&postingsFailingAfterNthCall{2, NewListPostings([]storage.SeriesRef{1, 2})},
+			NewListPostings([]storage.SeriesRef{3}),
+		)
+		p := NewListPostings([]storage.SeriesRef{2, 4})
+		candidates := []Postings{candidate, NewListPostings([]storage.SeriesRef{2})}
+
+		_, err := FindIntersectingPostingsWithLimit(p, candidates, 1)
+		require.EqualError(t, err, "seek postings 0: ttl exceeded")
+	})
+
 	t.Run("non-positive limit is unlimited", func(t *testing.T) {
 		for _, limit := range []int{0, -1} {
 			t.Run(strconv.Itoa(limit), func(t *testing.T) {
@@ -1316,7 +1365,7 @@ func TestPostingsWithIndexHeap(t *testing.T) {
 
 		for _, expected := range []storage.SeriesRef{1, 5, 10, 20, 25, 30, 50} {
 			require.Equal(t, expected, h.at())
-			require.NoError(t, h.seekHead(h.at()+1))
+			require.NoError(t, h.seekHead(h.at()+1, false))
 		}
 		require.True(t, h.empty())
 	})
@@ -1334,7 +1383,7 @@ func TestPostingsWithIndexHeap(t *testing.T) {
 
 		for _, expected := range []storage.SeriesRef{1, 5, 10, 20} {
 			require.Equal(t, expected, h.at())
-			require.NoError(t, h.seekHead(h.at()+1))
+			require.NoError(t, h.seekHead(h.at()+1, false))
 		}
 		require.Equal(t, storage.SeriesRef(25), h.at())
 		node := heap.Pop(&h).(postingsWithIndex)
