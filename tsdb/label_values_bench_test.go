@@ -15,6 +15,9 @@ package tsdb
 
 import (
 	"context"
+	"fmt"
+	"math/rand/v2"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -80,6 +83,83 @@ func BenchmarkLabelValues_SlowPath(b *testing.B) {
 		vals, err := idx.LabelValues(ctx, "val1", nil, matcher)
 		require.NoError(b, err)
 		require.Equal(b, []string{"common"}, vals)
+	}
+}
+
+// BenchmarkLabelValues_LimitedMatcher measures a complete Head-backed label-values read with the API hint for limit 10.
+func BenchmarkLabelValues_LimitedMatcher(b *testing.B) {
+	const cardinality = 20000
+	ctx := context.Background()
+	db, err := Open(b.TempDir(), nil, nil, DefaultOptions(), nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			b.Error(err)
+		}
+	})
+
+	app := db.AppenderV2(ctx)
+	order := rand.New(rand.NewPCG(1, 2)).Perm(cardinality)
+	want := make([]string, 0, 11)
+	for j, i := range order {
+		pod := fmt.Sprintf("pod_%06d", i)
+		if j < 11 {
+			want = append(want, pod)
+		}
+		if _, err := app.Append(0, labels.FromStrings("__name__", "up", "job", "all", "pod", pod), 0, 1000, 1, nil, nil, storage.AOptions{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	slices.Sort(want)
+	if err := app.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	matcher := labels.MustNewMatcher(labels.MatchEqual, "__name__", "up")
+	hints := &storage.LabelHints{Limit: 11}
+
+	// Validate outside the benchmark loop while the querier still owns the returned strings.
+	q, err := db.Querier(0, 2000)
+	if err != nil {
+		b.Fatal(err)
+	}
+	got, _, readErr := q.LabelValues(ctx, "pod", hints, matcher)
+	if readErr != nil {
+		if closeErr := q.Close(); closeErr != nil {
+			b.Error(closeErr)
+		}
+		b.Fatal(readErr)
+	}
+	valid := slices.Equal(want, got)
+	var mismatch string
+	if !valid {
+		mismatch = fmt.Sprintf("incorrect values: got %v, want %v", got, want)
+	}
+	closeErr := q.Close()
+	if closeErr != nil {
+		b.Fatal(closeErr)
+	}
+	if !valid {
+		b.Fatal(mismatch)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		q, err := db.Querier(0, 2000)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, _, readErr := q.LabelValues(ctx, "pod", hints, matcher)
+		closeErr := q.Close()
+		if readErr != nil {
+			b.Fatal(readErr)
+		}
+		if closeErr != nil {
+			b.Fatal(closeErr)
+		}
 	}
 }
 
