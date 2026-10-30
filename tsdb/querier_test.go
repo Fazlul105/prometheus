@@ -3006,12 +3006,15 @@ func TestLabelValuesWithMatchersPropagatesRecordedPostingsErrors(t *testing.T) {
 		candidatePostings map[string]index.Postings
 		podARef           storage.SeriesRef
 		podBRef           storage.SeriesRef
+		limit             int
+		omitPodB          bool
 	}{
 		{
 			name:            "matcher iterator retains an error while yielding the limiting hit",
 			matcherPostings: index.Merge(ctx, index.ErrPostings(context.Canceled), index.NewListPostings([]storage.SeriesRef{1})),
 			podARef:         1,
 			podBRef:         2,
+			limit:           1,
 		},
 		{
 			name:            "candidate iterator retains an error while yielding a reference",
@@ -3021,12 +3024,22 @@ func TestLabelValuesWithMatchersPropagatesRecordedPostingsErrors(t *testing.T) {
 			},
 			podARef: 2,
 			podBRef: 1,
+			limit:   1,
+		},
+		{
+			name:            "matcher error before candidate exhaustion is returned",
+			matcherPostings: index.Merge(ctx, index.ErrPostings(context.Canceled), index.NewListPostings([]storage.SeriesRef{10, 20})),
+			podARef:         1,
+			limit:           2,
+			omitPodB:        true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ix := newMockIndex()
 			require.NoError(t, ix.WritePostings("pod", "a", index.NewListPostings([]storage.SeriesRef{tc.podARef})))
-			require.NoError(t, ix.WritePostings("pod", "b", index.NewListPostings([]storage.SeriesRef{tc.podBRef})))
+			if !tc.omitPodB {
+				require.NoError(t, ix.WritePostings("pod", "b", index.NewListPostings([]storage.SeriesRef{tc.podBRef})))
+			}
 			reader := mockIndexWithRecordedPostingsError{
 				mockIndex:         ix,
 				matcherPostings:   tc.matcherPostings,
@@ -3034,7 +3047,7 @@ func TestLabelValuesWithMatchersPropagatesRecordedPostingsErrors(t *testing.T) {
 			}
 			q := &blockBaseQuerier{index: reader}
 
-			got, _, err := q.LabelValues(ctx, "pod", &storage.LabelHints{Limit: 1}, labels.MustNewMatcher(labels.MatchEqual, "job", "api"))
+			got, _, err := q.LabelValues(ctx, "pod", &storage.LabelHints{Limit: tc.limit}, labels.MustNewMatcher(labels.MatchEqual, "job", "api"))
 			require.ErrorIs(t, err, context.Canceled)
 			require.ErrorContains(t, err, "intersecting postings")
 			require.Nil(t, got)

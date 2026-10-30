@@ -1167,6 +1167,15 @@ func TestFindIntersectingPostings(t *testing.T) {
 		require.Equal(t, []int{0}, indexes)
 	})
 
+	t.Run("matcher error before candidate exhaustion is returned", func(t *testing.T) {
+		p := Merge(context.Background(), ErrPostings(context.Canceled), NewListPostings([]storage.SeriesRef{10, 20}))
+		candidates := []Postings{NewListPostings([]storage.SeriesRef{1})}
+
+		indexes, err := FindIntersectingPostingsWithLimit(p, candidates, 2)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Empty(t, indexes)
+	})
+
 	t.Run("matcher error recorded by a successful seek is returned", func(t *testing.T) {
 		p := Merge[Postings](context.Background(),
 			&postingsFailingAfterNthCall{2, NewListPostings([]storage.SeriesRef{1, 2})},
