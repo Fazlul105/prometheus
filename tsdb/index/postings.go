@@ -978,24 +978,21 @@ func findIntersectingPostings(p Postings, candidates []Postings, limit int) (ind
 		if !p.Seek(h.at()) {
 			return indexes, p.Err()
 		}
-		var matcherErr error
-		if limit > 0 {
-			matcherErr = p.Err()
-		}
 		if p.At() == h.at() {
 			if limit > 0 && len(indexes)+1 == limit {
 				indexes = append(indexes, h[0].index)
-				return indexes, matcherErr
+				return indexes, p.Err()
 			}
 			indexes = append(indexes, h.popIndex())
 		} else if err := h.seekHead(p.At(), limit > 0); err != nil {
 			return nil, err
 		}
-		if matcherErr != nil {
-			return indexes, matcherErr
-		}
 	}
 
+	if limit > 0 {
+		// A successful matcher seek can retain an error even if candidates exhaust first.
+		return indexes, p.Err()
+	}
 	return indexes, nil
 }
 
