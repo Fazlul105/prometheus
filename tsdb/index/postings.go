@@ -941,7 +941,19 @@ func (*bigEndianPostings) Err() error {
 // FindIntersectingPostings checks the intersection of p and candidates[i] for each i in candidates,
 // if intersection is non empty, then i is added to the indexes returned.
 // Returned indexes are not sorted.
-func FindIntersectingPostings(p Postings, candidates []Postings) (indexes []int, err error) {
+func FindIntersectingPostings(p Postings, candidates []Postings) ([]int, error) {
+	return findIntersectingPostings(p, candidates, 0)
+}
+
+// FindIntersectingPostingsWithLimit is like FindIntersectingPostings, but stops
+// after finding limit candidate postings that intersect p. It returns the same
+// prefix as FindIntersectingPostings. A non-positive limit is unlimited.
+// Returned indexes are not sorted.
+func FindIntersectingPostingsWithLimit(p Postings, candidates []Postings, limit int) ([]int, error) {
+	return findIntersectingPostings(p, candidates, limit)
+}
+
+func findIntersectingPostings(p Postings, candidates []Postings, limit int) (indexes []int, err error) {
 	h := make(postingsWithIndexHeap, 0, len(candidates))
 	for idx, it := range candidates {
 		switch {
@@ -961,6 +973,9 @@ func FindIntersectingPostings(p Postings, candidates []Postings) (indexes []int,
 			return indexes, p.Err()
 		}
 		if p.At() == h.at() {
+			if limit > 0 && len(indexes)+1 == limit {
+				return append(indexes, h[0].index), nil
+			}
 			indexes = append(indexes, h.popIndex())
 		} else if err := h.seekHead(p.At()); err != nil {
 			return nil, err

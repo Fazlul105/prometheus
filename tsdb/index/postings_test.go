@@ -1140,6 +1140,91 @@ func TestFindIntersectingPostings(t *testing.T) {
 		require.Empty(t, indexes)
 	})
 
+	t.Run("limit counts confirmed intersections in traversal order", func(t *testing.T) {
+		p := NewListPostings([]storage.SeriesRef{10, 20, 30, 40, 50})
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{1, 3, 8}), // Does not intersect.
+			NewListPostings([]storage.SeriesRef{10}),      // Intersects first.
+			NewListPostings([]storage.SeriesRef{15}),      // Does not intersect.
+			NewListPostings([]storage.SeriesRef{20}),      // Intersects second.
+			NewListPostings([]storage.SeriesRef{30}),      // Would intersect after the limit.
+		}
+
+		indexes, err := FindIntersectingPostingsWithLimit(p, candidates, 2)
+		require.NoError(t, err)
+		require.Equal(t, []int{1, 3}, indexes)
+	})
+
+	t.Run("non-positive limit is unlimited", func(t *testing.T) {
+		for _, limit := range []int{0, -1} {
+			t.Run(strconv.Itoa(limit), func(t *testing.T) {
+				p := NewListPostings([]storage.SeriesRef{10, 20, 30})
+				candidates := []Postings{
+					NewListPostings([]storage.SeriesRef{10}),
+					NewListPostings([]storage.SeriesRef{20}),
+					NewListPostings([]storage.SeriesRef{30}),
+				}
+
+				indexes, err := FindIntersectingPostingsWithLimit(p, candidates, limit)
+				require.NoError(t, err)
+				require.Equal(t, []int{0, 1, 2}, indexes)
+			})
+		}
+	})
+
+	t.Run("empty candidates", func(t *testing.T) {
+		indexes, err := FindIntersectingPostingsWithLimit(ErrPostings(context.Canceled), nil, 1)
+		require.NoError(t, err)
+		require.Nil(t, indexes)
+	})
+
+	t.Run("exhaustion before the limit returns confirmed intersections", func(t *testing.T) {
+		p := NewListPostings([]storage.SeriesRef{10, 20})
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{10}),
+			NewListPostings([]storage.SeriesRef{30}),
+		}
+
+		indexes, err := FindIntersectingPostingsWithLimit(p, candidates, 2)
+		require.NoError(t, err)
+		require.Equal(t, []int{0}, indexes)
+	})
+
+	t.Run("p error before the limit is returned", func(t *testing.T) {
+		p := &postingsFailingAfterNthCall{2, NewListPostings([]storage.SeriesRef{10, 20, 30})}
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{10}),
+			NewListPostings([]storage.SeriesRef{20}),
+		}
+
+		_, err := FindIntersectingPostingsWithLimit(p, candidates, 2)
+		require.EqualError(t, err, "ttl exceeded")
+	})
+
+	t.Run("candidate error before the limit is returned", func(t *testing.T) {
+		p := NewListPostings([]storage.SeriesRef{10, 20})
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{10}),
+			ErrPostings(context.Canceled),
+		}
+
+		_, err := FindIntersectingPostingsWithLimit(p, candidates, 1)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("iterator work after the limit is not visited", func(t *testing.T) {
+		p := NewListPostings([]storage.SeriesRef{10, 20, 30})
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{10}),
+			NewListPostings([]storage.SeriesRef{20}),
+			&postingsFailingAfterNthCall{2, NewListPostings([]storage.SeriesRef{25, 30})},
+		}
+
+		indexes, err := FindIntersectingPostingsWithLimit(p, candidates, 2)
+		require.NoError(t, err)
+		require.Equal(t, []int{0, 1}, indexes)
+	})
+
 	t.Run("p is ErrPostings", func(t *testing.T) {
 		p := ErrPostings(context.Canceled)
 		candidates := []Postings{NewListPostings([]storage.SeriesRef{1})}

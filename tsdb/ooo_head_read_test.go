@@ -396,15 +396,15 @@ func testOOOHeadChunkReader_LabelValues(t *testing.T, scenario sampleTypeScenari
 	app := head.AppenderV2(context.Background())
 
 	// Add in-order samples
-	_, _, err := scenario.appendFunc(app, labels.FromStrings("foo", "bar1"), 100, int64(1))
+	_, _, err := scenario.appendFunc(app, labels.FromStrings("foo", "bar1", "job", "other"), 100, int64(1))
 	require.NoError(t, err)
-	_, _, err = scenario.appendFunc(app, labels.FromStrings("foo", "bar2"), 100, int64(2))
+	_, _, err = scenario.appendFunc(app, labels.FromStrings("foo", "bar2", "job", "api"), 100, int64(2))
 	require.NoError(t, err)
 
 	// Add ooo samples for those series
-	_, _, err = scenario.appendFunc(app, labels.FromStrings("foo", "bar1"), 90, int64(1))
+	_, _, err = scenario.appendFunc(app, labels.FromStrings("foo", "bar1", "job", "other"), 90, int64(1))
 	require.NoError(t, err)
-	_, _, err = scenario.appendFunc(app, labels.FromStrings("foo", "bar2"), 90, int64(2))
+	_, _, err = scenario.appendFunc(app, labels.FromStrings("foo", "bar2", "job", "api"), 90, int64(2))
 	require.NoError(t, err)
 
 	require.NoError(t, app.Commit())
@@ -473,6 +473,12 @@ func testOOOHeadChunkReader_LabelValues(t *testing.T, scenario sampleTypeScenari
 			sort.Strings(values)
 			require.NoError(t, err)
 			require.Equal(t, tc.expValues4, values)
+
+			// bar1 is an earlier candidate but does not match the other-label selector.
+			values, err = oh.LabelValues(ctx, "foo", &storage.LabelHints{Limit: 1}, labels.MustNewMatcher(labels.MatchEqual, "job", "api"))
+			sort.Strings(values)
+			require.NoError(t, err)
+			require.Equal(t, []string{"bar2"}, values)
 		})
 	}
 }

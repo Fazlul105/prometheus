@@ -3740,6 +3740,19 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 					"boo",
 				},
 			},
+			// Preserve limit+1 warning detection after unioning selectors.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"match[]": []string{`test_metric4{dup=~"^1"}`, `test_metric4`},
+					"limit":   []string{"1"},
+				},
+				responseLen:   1,
+				warningsCount: 1,
+			},
 			// Label values with limit.
 			{
 				endpoint: api.labelValues,
