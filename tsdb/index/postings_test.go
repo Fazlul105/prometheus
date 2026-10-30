@@ -1212,6 +1212,17 @@ func TestFindIntersectingPostings(t *testing.T) {
 		require.ErrorIs(t, err, context.Canceled)
 	})
 
+	t.Run("candidate seek error before the limit is returned", func(t *testing.T) {
+		p := NewListPostings([]storage.SeriesRef{10, 20, 30})
+		candidates := []Postings{
+			NewListPostings([]storage.SeriesRef{10}),
+			&postingsFailingAfterNthCall{2, NewListPostings([]storage.SeriesRef{15, 20})},
+		}
+
+		_, err := FindIntersectingPostingsWithLimit(p, candidates, 2)
+		require.EqualError(t, err, "seek postings 1: ttl exceeded")
+	})
+
 	t.Run("iterator work after the limit is not visited", func(t *testing.T) {
 		p := NewListPostings([]storage.SeriesRef{10, 20, 30})
 		candidates := []Postings{
