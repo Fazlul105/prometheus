@@ -126,6 +126,7 @@ Enables the synthesis of start timestamps (ST) for cumulative metrics (Counters,
 > * Synthesis works only with scraped data (RW and Otel receiver are not implemented).
 > * Synthesis requires ordered samples. As a result, cumulative samples without ST that are out of order will be rejected despite the `tsdb. out_of_order_time_window` setting.
 > * If an append fails for a series (e.g., due to out-of-order samples being rejected), the synthesis state for that series is cleared. As a result, the next sample received after the failure will be treated as the first sample again and will be dropped to establish a new reference point.
+> * If a series changes metric type or switches between scalar samples and native histograms, synthesis establishes a new reference point and drops the first sample of the new cumulative stream. Noncumulative metrics are passed through unchanged and clear any synthesis state. Native integer and float histograms share synthesis state.
 
 ## Concurrent evaluation of independent rules
 

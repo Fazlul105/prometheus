@@ -2499,11 +2499,12 @@ func TestScrapeLoopAppend_StartTimeSynthesis_TypeChanges(t *testing.T) {
 				require.Len(t, appTest.ResultSamples(), before+1)
 				got := appTest.ResultSamples()[before]
 				wantValue, wantST := 5.0, int64(1000)
-				if tc.compatible {
+				switch {
+				case tc.compatible:
 					wantValue = float64(5 * i)
-				} else if i >= 4 {
+				case i >= 4:
 					wantST = 5000
-				} else if i >= 2 {
+				case i >= 2:
 					if tc.cumulative {
 						wantST = 3000
 					} else {

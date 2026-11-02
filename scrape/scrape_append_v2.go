@@ -577,26 +577,31 @@ func (*scrapeLoop) checkAndSynthesizeStartTime(
 	var skipAppend bool
 	var c *stCache
 
+	// Eligibility can change even when the series name and labels stay the same.
+	var mName string
+	switch sampleType {
+	case model.MetricTypeCounter, model.MetricTypeHistogram:
+		mName = lset.Get(model.MetricNameLabel)
+	case model.MetricTypeSummary:
+		mName = lset.Get(model.MetricNameLabel)
+		if !strings.HasSuffix(mName, "_count") && !strings.HasSuffix(mName, "_sum") {
+			return st, val, h, fh, skipAppend, c
+		}
+	default:
+		return st, val, h, fh, skipAppend, c
+	}
 	// TODO(https://github.com/prometheus/prometheus/issues/1790): Move isSeriesPartOfFamily inside parsers.
-	if ce == nil || ce.st == nil {
-		var mName string
-		switch sampleType {
-		case model.MetricTypeCounter, model.MetricTypeHistogram:
-			mName = lset.Get(model.MetricNameLabel)
-		case model.MetricTypeSummary:
-			mName = lset.Get(model.MetricNameLabel)
-			if !strings.HasSuffix(mName, "_count") && !strings.HasSuffix(mName, "_sum") {
-				return st, val, h, fh, skipAppend, c
-			}
-		default:
-			return st, val, h, fh, skipAppend, c
-		}
-		if !isSeriesPartOfFamilyStr(mName, sampleMFName, sampleType) {
-			return st, val, h, fh, skipAppend, c
-		}
-		c = &stCache{}
-	} else {
+	if !isSeriesPartOfFamilyStr(mName, sampleMFName, sampleType) {
+		return st, val, h, fh, skipAppend, c
+	}
+
+	if ce != nil {
 		c = ce.st
+	}
+	// Native integer and float histograms share histogramSynthesis, but neither
+	// can reuse a scalar anchor. A changed metric type also needs a fresh anchor.
+	if c == nil || c.typ != sampleType || (c.h != nil) != (h != nil || fh != nil) {
+		c = &stCache{typ: sampleType}
 	}
 
 	switch {

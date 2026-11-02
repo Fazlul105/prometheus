@@ -14,6 +14,8 @@
 package scrape
 
 import (
+	"github.com/prometheus/common/model"
+
 	"github.com/prometheus/prometheus/model/histogram"
 )
 
@@ -32,9 +34,10 @@ import (
 // See https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/metricstarttimeprocessor.
 // TODO(ridwanmsharif): Make this a struct usable by a go interface (see https://github.com/prometheus/prometheus/pull/18279#discussion_r3032221849).
 type stCache struct {
-	f  *floatSynthesis
-	h  *histogramSynthesis
-	st int64
+	f   *floatSynthesis
+	h   *histogramSynthesis
+	st  int64
+	typ model.MetricType
 }
 
 type floatSynthesis struct {
