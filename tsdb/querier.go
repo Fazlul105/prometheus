@@ -837,8 +837,14 @@ func (p *populateWithDelSeriesIterator) reset(blockID ulid.ULID, cr ChunkReader,
 
 func (p *populateWithDelSeriesIterator) Next() chunkenc.ValueType {
 	if p.curr != nil {
+		if p.curr.Err() != nil {
+			return chunkenc.ValNone
+		}
 		if valueType := p.curr.Next(); valueType != chunkenc.ValNone {
 			return valueType
+		}
+		if p.curr.Err() != nil {
+			return chunkenc.ValNone
 		}
 	}
 
@@ -850,6 +856,9 @@ func (p *populateWithDelSeriesIterator) Next() chunkenc.ValueType {
 		}
 		if valueType := p.curr.Next(); valueType != chunkenc.ValNone {
 			return valueType
+		}
+		if p.curr.Err() != nil {
+			return chunkenc.ValNone
 		}
 	}
 	return chunkenc.ValNone
